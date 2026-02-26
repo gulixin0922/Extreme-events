@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import base64
 import time
@@ -13,8 +14,6 @@ from tqdm import tqdm
 from datetime import datetime
 from PIL import Image
 
-import sys
-
 # 允许从命令行参数或环境变量注入
 DATASET_ROOT = sys.argv[1]
 RAW_DATA_BASE_PATH = sys.argv[2]
@@ -23,7 +22,7 @@ OUTPUT_ROOT = "./output"
 if not os.path.exists(OUTPUT_ROOT):
     os.makedirs(OUTPUT_ROOT)
 BASE_NAME = os.path.basename(DATASET_ROOT)
-OUTPUT_FILE = f"eval_result_{BASE_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+OUTPUT_FILE = f"eval_result_{BASE_NAME}_{TARGET_FILE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 OUTPUT_FILE = os.path.join(OUTPUT_ROOT, OUTPUT_FILE)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -141,7 +140,7 @@ def prepare_image_messages(
     image_max_num: int
 ) -> List[Dict[str, Any]]:
     """
-    openai输入要求：图片大小总和不可以大于50M，图片数量最多500
+    请求输入要求：图片大小总和不可以大于total_max_size，图片数量最多image_max_num
     """
     if not image_rel_paths:
         return []
@@ -161,11 +160,11 @@ def prepare_image_messages(
     for p in paths:
         full_path = os.path.join(base_path, p)
         b64 = encode_image(full_path, max_size_per_image)
-        total_img_bytes += len(b64)
         messages.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "low"}
         })
+        total_img_bytes += len(b64)
     print(f"Total image bytes after encode image: {total_img_bytes} bytes")
     return messages, paths
 
