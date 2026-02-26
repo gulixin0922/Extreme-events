@@ -4,23 +4,39 @@ import base64
 import time
 import re
 import math
+import io
+import random
+import concurrent.futures
 from typing import Tuple, Optional, Dict, Any, List
 from openai import OpenAI
 from tqdm import tqdm
 from datetime import datetime
+from PIL import Image
 
-DATASET_ROOT = r""
-RAW_DATA_BASE_PATH = r""
-TARGET_FILE = "Image_Only.json"
-OUTPUT_FILE = f"eval_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+import sys
+
+# 允许从命令行参数或环境变量注入
+DATASET_ROOT = sys.argv[1]
+RAW_DATA_BASE_PATH = sys.argv[2]
+TARGET_FILE = sys.argv[3]
+OUTPUT_ROOT = "./output"
+if not os.path.exists(OUTPUT_ROOT):
+    os.makedirs(OUTPUT_ROOT)
+BASE_NAME = os.path.basename(DATASET_ROOT)
+OUTPUT_FILE = f"eval_result_{BASE_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+OUTPUT_FILE = os.path.join(OUTPUT_ROOT, OUTPUT_FILE)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
-CLIENT_TIMEOUT = 60
-MAX_RETRY = 3
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "64"))
+TOTAL_MAX_SIZE = 45 * 1024 * 1024 # 45MB
+IMAGE_MAX_NUM = 500 # 500 images
+temperature = 0.1
+max_tokens = 300
 
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=CLIENT_TIMEOUT)
+client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=3600)
+
 
 def load_metadata(root_dir: str) -> str:
     path = os.path.join(root_dir, "dataset_metadata.json")
@@ -52,32 +68,107 @@ def load_metadata(root_dir: str) -> str:
         
     return text
 
-def encode_image(image_path: str) -> str:
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
 
-def prepare_image_messages(image_rel_paths: str, base_path: str) -> List[Dict[str, Any]]:
+# def encode_image(image_path: str, max_size: int) -> str:
+#     """
+#     将图片编码为base64字符串，如果图片超过max_size（字节），则报错或处理。
+#     默认最大为4MB。
+#     """
+#     file_size = os.path.getsize(image_path)
+#     if file_size > max_size:
+#         # 如果图片超过max_size，则缩小图片，直到小于max_size
+#         with Image.open(image_path) as img:
+#             ratio = (max_size / file_size) ** 0.5
+#             print(f"img_original_size: {img.size}, img_original_bytes_size: {file_size}, ratio: {ratio}")
+#             while True:
+#                 new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+#                 img = img.resize(new_size)
+#                 buffer = io.BytesIO()
+#                 img.save(buffer, format="PNG", optimize=True)
+#                 img_bytes = buffer.getvalue()
+#                 print(f"img_new_size: {img.size}, img_new_bytes_size: {len(img_bytes)}, max_size: {max_size}")
+#                 if len(img_bytes) <= max_size:
+#                     break
+#             buffer.seek(0)
+#             return base64.b64encode(buffer.read()).decode('utf-8')
+#     else:
+#         with open(image_path, "rb") as image_file:
+#             return base64.b64encode(image_file.read()).decode('utf-8')
+
+
+def encode_image(image_path: str, max_size: int) -> str:
+    """
+    将图片编码为base64字符串，如果图片超过max_size（字节），则在不改变图像尺寸的情况下进行压缩（调整JPEG/WEBP等压缩格式质量）。
+    """
+    # 先获取图片字节数
+    file_size = os.path.getsize(image_path)
+    # 如果图片字节数超过max_size，则进行压缩
+    if file_size > max_size:
+        with Image.open(image_path) as img:
+            # 优先用JPEG压缩，若不是RGB模式则先转换
+            buffer = io.BytesIO()
+            quality = 95
+            min_quality = 20
+            img_for_save = img.convert("RGB") if img.mode != "RGB" else img
+            while quality >= min_quality:
+                buffer.seek(0)
+                # 截断缓冲区 / 文件的内容，只保留指定位置之前的部分，删除该位置之后的所有内容。
+                buffer.truncate()
+                img_for_save.save(buffer, format="JPEG", quality=quality, optimize=True)
+                img_bytes = buffer.getvalue()
+                if len(img_bytes) <= max_size:
+                    break
+                quality -= 5
+            else:
+                # 如果最小quality还超出max_size，再转为webp继续压缩
+                buffer.seek(0)
+                buffer.truncate()
+                img_for_save.save(buffer, format="WEBP", quality=min_quality, method=6)
+                img_bytes = buffer.getvalue()
+                if len(img_bytes) > max_size:
+                    raise ValueError(f"Image {image_path} cannot be compressed under {max_size} bytes")
+            buffer.seek(0)
+            return base64.b64encode(buffer.read()).decode('utf-8')
+    else:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+
+
+def prepare_image_messages(
+    image_rel_paths: str, 
+    base_path: str, 
+    total_max_size: int,
+    image_max_num: int
+) -> List[Dict[str, Any]]:
+    """
+    openai输入要求：图片大小总和不可以大于50M，图片数量最多500
+    """
     if not image_rel_paths:
         return []
     
     paths = [p.strip() for p in image_rel_paths.split(',') if p.strip()]
     messages = []
     
+    if len(paths) > image_max_num:
+        original_num = len(paths)
+        paths = paths[:image_max_num]
+        print(f"Warning: Image number {original_num} exceeds max_num ({image_max_num}), only use the first {image_max_num} images")
+    
+    # 计算每张图片的最大字节数, base64编码后的字节数通常是原始的1.33倍
+    max_size_per_image = (total_max_size / 1.33 / 1.33) // len(paths)
+    print(f"Total max size: {total_max_size / 1.33 / 1.33} bytes, Image num: {len(paths)}, Max size per image: {max_size_per_image} bytes")
+    total_img_bytes = 0
     for p in paths:
         full_path = os.path.join(base_path, p)
-        if os.path.exists(full_path):
-            try:
-                b64 = encode_image(full_path)
-                messages.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "low"}
-                })
-            except Exception:
-                pass
-        else:
-            pass
-            
-    return messages
+        b64 = encode_image(full_path, max_size_per_image)
+        total_img_bytes += len(b64)
+        messages.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "low"}
+        })
+    print(f"Total image bytes after encode image: {total_img_bytes} bytes")
+    return messages, paths
+
 
 def format_station_data(stations: Optional[Dict[str, Any]]) -> str:
     if not stations:
@@ -88,17 +179,21 @@ def format_station_data(stations: Optional[Dict[str, Any]]) -> str:
     except:
         return "Error parsing station data."
 
+
 def normalize_text(s: str) -> str:
     if s is None: return ""
     s = s.strip().lower()
     s = re.sub(r'\s+', ' ', s)
     return s
 
+
 def try_parse_numeric(s: str) -> Optional[float]:
+    # 提取文本中第一个整数 / 浮点数（支持正负号），正则兼顾了「纯整数」「带小数」「带正负号」三种常见数值格式
     m = re.search(r'([-+]?\d+(?:\.\d+)?)', normalize_text(s))
     if m:
         return float(m.group(1))
     return None
+
 
 def extract_final_answer(model_response: str) -> Dict[str, Any]:
     json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', model_response, re.DOTALL)
@@ -118,23 +213,24 @@ def extract_final_answer(model_response: str) -> Dict[str, Any]:
         
     return {"final_answer": model_response.strip(), "answer_type": "text"}
 
+
 def qa_instance_score(ground_truth: str, extracted: Dict[str, Any]) -> Dict[str, Any]:
     gt = str(ground_truth).strip()
     pred = str(extracted.get("final_answer", "")).strip()
     
-    is_categorical = re.match(r'^[A-Za-z\s]+$', gt) and len(gt) < 30
-    
     if not pred:
         return {"score": 0.0, "reason": "Empty prediction"}
 
-    YES_SET = {"yes", "true", "是", "1"}
-    NO_SET = {"no", "false", "否", "0"}
+    # boolean
+    YES_SET = {"yes", "true", "是"}
+    NO_SET = {"no", "false", "否"}
     if gt.lower() in YES_SET or gt.lower() in NO_SET:
         p_norm = pred.lower()
         p_bool = "yes" if any(x in p_norm for x in YES_SET) else ("no" if any(x in p_norm for x in NO_SET) else "unknown")
         g_bool = "yes" if gt.lower() in YES_SET else "no"
         return {"score": 1.0 if p_bool == g_bool else 0.0, "type": "boolean"}
 
+    # numeric
     gt_num = try_parse_numeric(gt)
     if gt_num is not None:
         pred_num = try_parse_numeric(pred)
@@ -144,15 +240,20 @@ def qa_instance_score(ground_truth: str, extracted: Dict[str, Any]) -> Dict[str,
             score = 1.0 if error <= tolerance else max(0.0, 1.0 - (error / (gt_num + 1e-6)))
             return {"score": score, "type": "numeric", "gt": gt_num, "pred": pred_num}
     
+    # classification
+    # gt 是非空、仅含字母 / 空格、长度 < 30 的字符串，则认为是分类问题
+    is_categorical = re.match(r'^[A-Za-z\s]+$', gt) and len(gt) < 30
     if is_categorical:
         if gt.lower() == pred.lower():
             return {"score": 1.0, "type": "classification_exact"}
         if gt.lower() in pred.lower() or pred.lower() in gt.lower():
             return {"score": 0.8, "type": "classification_partial"}
-            
+    
+    # text     
     common = set(pred.lower().split()) & set(gt.lower().split())
     score = len(common) / max(len(gt.split()), 1)
     return {"score": min(1.0, score), "type": "text_overlap"}
+
 
 def evaluate_dataset():
     dataset_path = os.path.join(DATASET_ROOT, TARGET_FILE)
@@ -165,27 +266,46 @@ def evaluate_dataset():
     with open(dataset_path, 'r', encoding='utf-8') as f:
         dataset = json.load(f)
     
+    # # 随机打乱数据集，并取前20条数据，用于调试
+    # random.seed(42)
+    # random.shuffle(dataset)
+    # dataset = dataset[:20]
     print(f"Loaded {len(dataset)} items from {TARGET_FILE}")
     
-    results = []
-    
-    for i, item in enumerate(tqdm(dataset)):
+    # 1. 构建请求的参数
+    def build_request(item, image_with_prefix: bool = True):
         question = item.get("Text", "")
         images_str = item.get("Image", "")
         stations_data = item.get("Stations", None)
         gt = str(item.get("Ground truth", ""))
-        
+
         system_prompt = "You are an expert AI for disaster assessment from satellite imagery and station data.\n"
         if metadata_context:
             system_prompt += metadata_context
-        
+
         user_content = []
-        user_content.append({"type": "text", "text": f"Task Instruction: {question}"})
+        img_msgs, paths = prepare_image_messages(images_str, RAW_DATA_BASE_PATH, TOTAL_MAX_SIZE, IMAGE_MAX_NUM)
+        if image_with_prefix == True:
+            for each_img_msg, each_path in zip(img_msgs, paths):
+                path_split = each_path.split('/')
+                day = path_split[-1]
+                band = path_split[-2]
+                sensor = path_split[-3]
+                user_content.append({"type": "text", "text": f"Image of Satellite Sensor: {sensor}, Band: {band}, Day: {day}"})
+                user_content.append(each_img_msg)
+        else:
+            user_content.extend(img_msgs)
         
+        # assess the risk of an impending disaster should answer "Yes" / "No"
+        if 'assess the risk of an impending disaster' in question:
+            question += "Answer yes or no: yes means a disaster will occur, no means no disaster will occur."
+            
+        user_content.append({"type": "text", "text": f"Task Instruction: {question}"})
+
         if stations_data:
             st_text = format_station_data(stations_data)
             user_content.append({"type": "text", "text": f"Station Data Context:\n{st_text}"})
-            
+
         user_content.append({"type": "text", "text": 
             "\nOutput Requirement:\n"
             "Please analyze the inputs and provide the answer.\n"
@@ -196,11 +316,24 @@ def evaluate_dataset():
             "For numeric answers, output only the number.\n"
             "For classification, output the class name."
         })
-        
-        img_msgs = prepare_image_messages(images_str, RAW_DATA_BASE_PATH)
-        user_content.extend(img_msgs)
-        
+
+        req = {
+            "item": item,
+            "gt": gt,
+            "system_prompt": system_prompt,
+            "user_content": user_content
+        }
+        return req
+
+    # 2. 定义单个请求的执行函数
+    def do_call(item):
+        req = build_request(item)
         raw_resp = ""
+        item = req["item"]
+        gt = req["gt"]
+        system_prompt = req["system_prompt"]
+        user_content = req["user_content"]
+
         try:
             resp = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -208,8 +341,8 @@ def evaluate_dataset():
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content}
                 ],
-                temperature=0.1,
-                max_tokens=300
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
             raw_resp = resp.choices[0].message.content
             extracted = extract_final_answer(raw_resp)
@@ -218,7 +351,6 @@ def evaluate_dataset():
             extracted = {"final_answer": "API Error"}
 
         score_info = qa_instance_score(gt, extracted)
-        
         result_item = {
             "id": item.get("Question_id"),
             "task": item.get("Task"),
@@ -229,10 +361,18 @@ def evaluate_dataset():
             "score_type": score_info.get("type"),
             "raw_response": raw_resp
         }
-        results.append(result_item)
-        
-        if i < 3: 
-            print(f"\n[Sample {i}] GT: {gt} | Pred: {extracted.get('final_answer')} | Score: {score_info['score']}")
+        return (result_item, gt, extracted)
+
+    # 3. 多线程并发执行所有请求（比如最多MAX_WORKERS个并发线程/任务）
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # tqdm 需要外层包一层list使其能够预期获得总长度
+        future_map = {executor.submit(do_call, item): idx for idx, item in enumerate(dataset)}
+        for i, future in enumerate(tqdm(concurrent.futures.as_completed(future_map), total=len(dataset))):
+            result_item, gt, extracted = future.result()
+            results.append(result_item)
+            if i < 3:
+                print(f"\n[Sample {i}] GT: {gt} | Pred: {extracted.get('final_answer')} | Score: {result_item['score']}")
 
     total_score = sum(r["score"] for r in results)
     avg_score = total_score / len(results) if results else 0
@@ -253,6 +393,7 @@ def evaluate_dataset():
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump({"summary": {"overall": avg_score, "by_task": {k: sum(v)/len(v) for k,v in task_stats.items()}}, "details": results}, f, indent=2, ensure_ascii=False)
     print(f"Results saved to {OUTPUT_FILE}")
+
 
 if __name__ == "__main__":
     evaluate_dataset()

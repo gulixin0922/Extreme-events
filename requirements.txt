@@ -1,0 +1,2 @@
+openai
+Pillow==12.1.1
