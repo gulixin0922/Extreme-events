@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import json
 import base64
 import time
@@ -8,33 +9,47 @@ import math
 import io
 import random
 import concurrent.futures
+import copy
 from typing import Tuple, Optional, Dict, Any, List
 from openai import OpenAI
 from tqdm import tqdm
 from datetime import datetime
 from PIL import Image
 
-# 允许从命令行参数或环境变量注入
-DATASET_ROOT = sys.argv[1]
-RAW_DATA_BASE_PATH = sys.argv[2]
-TARGET_FILE = sys.argv[3]
-OUTPUT_ROOT = "./output"
-if not os.path.exists(OUTPUT_ROOT):
-    os.makedirs(OUTPUT_ROOT)
-BASE_NAME = os.path.basename(DATASET_ROOT)
-OUTPUT_FILE = f"eval_result_{BASE_NAME}_{TARGET_FILE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-OUTPUT_FILE = os.path.join(OUTPUT_ROOT, OUTPUT_FILE)
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "64"))
-TOTAL_MAX_SIZE = 45 * 1024 * 1024 # 45MB
-IMAGE_MAX_NUM = 500 # 500 images
-temperature = 0.1
-max_tokens = 300
-
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=3600)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--dataset-root", type=str, required=True, default="")
+parser.add_argument("--raw-data-base-path", type=str, required=True, default="")
+parser.add_argument("--target-file", type=str, default="Image_Only.json")
+parser.add_argument("--output-root", default="./output")
+parser.add_argument("--model-name", type=str, default="gpt-4o")
+parser.add_argument("--max-workers", type=int, default=64)
+parser.add_argument("--total-max-size", type=int, default=int(45 * 1024 * 1024))
+parser.add_argument("--image-max-num", type=int, default=500)
+parser.add_argument("--temperature", type=float, default=0.1)
+parser.add_argument("--max-tokens", type=int, default=300)
+parser.add_argument("--resume", action="store_true")
+parser.add_argument("--resume-file", type=str, default="")
+args = parser.parse_args()
+
+DATASET_ROOT = args.dataset_root
+BASE_NAME = os.path.basename(DATASET_ROOT)
+RAW_DATA_BASE_PATH = args.raw_data_base_path
+TARGET_FILE = args.target_file
+OUTPUT_ROOT = args.output_root
+MODEL_NAME = args.model_name
+MAX_WORKERS = args.max_workers
+TOTAL_MAX_SIZE = args.total_max_size  # 45MB
+IMAGE_MAX_NUM = args.image_max_num  # max images
+temperature = args.temperature
+max_tokens = args.max_tokens
+resume = args.resume
+resume_file = args.resume_file
+if not os.path.exists(OUTPUT_ROOT):
+    os.makedirs(OUTPUT_ROOT)
 
 
 def load_metadata(root_dir: str) -> str:
@@ -153,19 +168,19 @@ def prepare_image_messages(
         paths = paths[:image_max_num]
         print(f"Warning: Image number {original_num} exceeds max_num ({image_max_num}), only use the first {image_max_num} images")
     
-    # 计算每张图片的最大字节数, base64编码后的字节数通常是原始的1.33倍
+    # 计算每张图片的最大字节数, base64编码后的字节数通常是原始的1.33倍，要换算成原始字节数
     max_size_per_image = (total_max_size / 1.33 / 1.33) // len(paths)
-    print(f"Total max size: {total_max_size / 1.33 / 1.33} bytes, Image num: {len(paths)}, Max size per image: {max_size_per_image} bytes")
+    # print(f"Total max size: {total_max_size / 1.33 / 1.33} bytes, Image num: {len(paths)}, Max size per image: {max_size_per_image} bytes")
     total_img_bytes = 0
     for p in paths:
         full_path = os.path.join(base_path, p)
         b64 = encode_image(full_path, max_size_per_image)
+        total_img_bytes += len(b64)
         messages.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "low"}
         })
-        total_img_bytes += len(b64)
-    print(f"Total image bytes after encode image: {total_img_bytes} bytes")
+    # print(f"Total image bytes after encode image: {total_img_bytes} bytes")
     return messages, paths
 
 
@@ -200,6 +215,7 @@ def extract_final_answer(model_response: str) -> Dict[str, Any]:
         try:
             return json.loads(json_match.group(1))
         except:
+            print(f"Error parsing JSON: {json_match.group(1)}")
             pass
             
     try:
@@ -208,6 +224,7 @@ def extract_final_answer(model_response: str) -> Dict[str, Any]:
         if start != -1 and end != -1:
             return json.loads(model_response[start:end+1])
     except:
+        print(f"Error parsing JSON: {model_response[start:end+1]}")
         pass
         
     return {"final_answer": model_response.strip(), "answer_type": "text"}
@@ -268,8 +285,28 @@ def evaluate_dataset():
     # # 随机打乱数据集，并取前20条数据，用于调试
     # random.seed(42)
     # random.shuffle(dataset)
-    # dataset = dataset[:20]
+    # dataset = dataset[:1]
     print(f"Loaded {len(dataset)} items from {TARGET_FILE}")
+    
+    # save results to file
+    results = []
+    if resume:
+        OUTPUT_FILE = os.path.join(OUTPUT_ROOT, resume_file)
+        if os.path.exists(OUTPUT_FILE):
+            with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+                results = json.load(f)['details']
+                # remove results with API Error or empty prediction
+                remain_results_ids = [r['id'] for r in results if r['prediction'] and r['prediction'] != 'API Error']
+                results = [r for r in results if r['id'] in remain_results_ids]
+                print(f"Loaded {len(results)} results from {resume_file}")
+                for item in copy.deepcopy(dataset):
+                    if item['Question_id'] in remain_results_ids:
+                        # remove items that have already evaluated
+                        dataset.remove(item)
+                print(f"Remaining {len(dataset)} items to evaluate in dataset after resume.")
+    else:
+        OUTPUT_FILE = f"eval_result_{BASE_NAME}_{MODEL_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        OUTPUT_FILE = os.path.join(OUTPUT_ROOT, OUTPUT_FILE)
     
     # 1. 构建请求的参数
     def build_request(item, image_with_prefix: bool = True):
@@ -328,6 +365,7 @@ def evaluate_dataset():
     def do_call(item):
         req = build_request(item)
         raw_resp = ""
+        raw_reasoning_content = ""
         item = req["item"]
         gt = req["gt"]
         system_prompt = req["system_prompt"]
@@ -344,6 +382,8 @@ def evaluate_dataset():
                 max_tokens=max_tokens,
             )
             raw_resp = resp.choices[0].message.content
+            if hasattr(resp.choices[0].message, "reasoning_content"):
+                raw_reasoning_content = resp.choices[0].message.reasoning_content
             extracted = extract_final_answer(raw_resp)
         except Exception as e:
             print(f"API Error: {e}")
@@ -358,19 +398,19 @@ def evaluate_dataset():
             "prediction": extracted.get("final_answer"),
             "score": score_info["score"],
             "score_type": score_info.get("type"),
-            "raw_response": raw_resp
+            "raw_response": raw_resp,
+            "raw_reasoning_content": raw_reasoning_content
         }
         return (result_item, gt, extracted)
 
     # 3. 多线程并发执行所有请求（比如最多MAX_WORKERS个并发线程/任务）
-    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # tqdm 需要外层包一层list使其能够预期获得总长度
         future_map = {executor.submit(do_call, item): idx for idx, item in enumerate(dataset)}
         for i, future in enumerate(tqdm(concurrent.futures.as_completed(future_map), total=len(dataset))):
             result_item, gt, extracted = future.result()
             results.append(result_item)
-            if i < 3:
+            if i < 10:
                 print(f"\n[Sample {i}] GT: {gt} | Pred: {extracted.get('final_answer')} | Score: {result_item['score']}")
 
     total_score = sum(r["score"] for r in results)
